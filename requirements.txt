@@ -1,0 +1,1 @@
+# Aucune dépendance externe : devagent n'utilise que la bibliothèque standard Python.
