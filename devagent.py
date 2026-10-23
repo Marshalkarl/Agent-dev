@@ -7,7 +7,7 @@ Commandes :
   docs      met à jour la documentation après confirmation
   test      lance les tests et diagnostique les échecs
   fix       lance les tests et corrige les échecs (avec aperçu du diff)
-  pr        rédige le titre et la description d'une pull request
+  pr        rédige le titre et la description d'une pull request [--create]
   explain   explique un fichier ou dossier                       <cible>
   hook      installe un hook pre-commit de relecture automatique
   chat      discussion libre sur le dépôt
@@ -16,6 +16,7 @@ import argparse
 import difflib
 import json
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -25,7 +26,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 # Fournisseurs gratuits compatibles avec l'API « OpenAI chat completions ».
 # Les offres gratuites et les noms de modèles changent : au besoin, utilisez --model
@@ -48,6 +49,7 @@ MAX_OUT = int(os.getenv("DEVAGENT_MAX_OUT", "20000"))  # taille max d'un résult
 MAX_PREVIEW = 80        # lignes max d'un aperçu de diff
 SENSITIVE_NAMES = {"id_rsa", "id_ed25519"}
 SENSITIVE_EXT = {".pem", ".key"}
+GITHUB_API = "https://api.github.com"
 
 os.system("")  # active les couleurs ANSI sous Windows
 
@@ -63,8 +65,9 @@ Règles :
 - Ne devine pas : si tu as besoin d'un fichier, lis-le.
 - Pour modifier du code, préfère edit_file (changement ciblé) à write_file (fichier entier).
   Fais des modifications minimales, sans reformater ce qui n'est pas concerné.
-- Les actions qui modifient quelque chose (edit_file, write_file, run_tests, git_commit)
-  demandent une confirmation humaine : explique brièvement pourquoi tu les proposes.
+- Les actions qui modifient quelque chose (edit_file, write_file, run_tests, git_commit,
+  create_pull_request) demandent une confirmation humaine : explique brièvement pourquoi
+  tu les proposes.
 - Messages de commit au format Conventional Commits (feat:, fix:, docs:, refactor:, test:, chore:).
 - Réponds en français, de façon concise."""
 
@@ -85,6 +88,9 @@ PROMPTS = {
           "un titre et une description de pull request : contexte, changements, risques, "
           "comment tester.",
 }
+
+PR_CREATE_SUFFIX = (" Ensuite, appelle create_pull_request avec ce titre et cette description "
+                    "pour créer la pull request sur GitHub.")
 
 
 def find_root() -> Path:
@@ -161,6 +167,33 @@ def system_text() -> str:
     return text
 
 
+# --------------------------------------------------------------------------- GitHub
+def default_branch() -> str:
+    """Branche principale locale (main, master ou develop), ou chaîne vide."""
+    for cand in ("main", "master", "develop"):
+        if subprocess.run(["git", "rev-parse", "--verify", "-q", cand],
+                          cwd=ROOT, capture_output=True).returncode == 0:
+            return cand
+    return ""
+
+
+def current_branch() -> str:
+    r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                       cwd=ROOT, capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def github_repo() -> str:
+    """Déduit « utilisateur/depot » à partir du remote origin."""
+    r = subprocess.run(["git", "remote", "get-url", "origin"],
+                       cwd=ROOT, capture_output=True, text=True)
+    url = r.stdout.strip()
+    m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$", url)
+    if r.returncode != 0 or not m:
+        raise RuntimeError("Le remote 'origin' n'est pas un dépôt GitHub.")
+    return m.group(1)
+
+
 # --------------------------------------------------------------------------- outils
 def git_status() -> str:
     return sh(["git", "status", "--short"])
@@ -171,14 +204,9 @@ def get_diff(staged: bool = False) -> str:
 
 
 def branch_diff(base: str = "") -> str:
+    base = base or default_branch()
     if not base:
-        for cand in ("main", "master", "develop"):
-            if subprocess.run(["git", "rev-parse", "--verify", "-q", cand],
-                              cwd=ROOT, capture_output=True).returncode == 0:
-                base = cand
-                break
-        else:
-            return "Branche principale introuvable : préciser `base`."
+        return "Branche principale introuvable : préciser `base`."
     return sh(["git", "diff", f"{base}...HEAD"])
 
 
@@ -254,9 +282,71 @@ def git_commit(message: str) -> str:
     return sh(["git", "commit", "-m", message])
 
 
+def create_pull_request(title: str, body: str = "", base: str = "") -> str:
+    """Crée une pull request sur GitHub via l'API (confirmation humaine requise).
+
+    Le jeton GITHUB_TOKEN n'est lu que ici : il n'est jamais envoyé à l'IA.
+    """
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        return "Erreur : variable GITHUB_TOKEN manquante."
+    if not title.strip():
+        return "Erreur : le titre de la pull request est vide."
+
+    repo = github_repo()
+    head = current_branch()
+    base = base or default_branch()
+    if not base:
+        return "Erreur : branche de base introuvable (préciser `base`)."
+    if head in ("", "HEAD") or head == base:
+        return f"Erreur : placez-vous sur une branche de travail (actuellement « {head} »)."
+
+    print(color(f"\nPull request : {repo}  {head} → {base}", "1"))
+    print(color(f"Titre : {title}", "1"))
+    print(body[:1500] + ("\n[...]" if len(body) > 1500 else ""))
+    if not confirm("Créer cette pull request sur GitHub ?"):
+        return "Refusé par l'utilisateur."
+
+    # La branche doit exister sur GitHub avant de pouvoir ouvrir la PR.
+    on_remote = subprocess.run(["git", "ls-remote", "--exit-code", "--heads", "origin", head],
+                               cwd=ROOT, capture_output=True, text=True).returncode == 0
+    if not on_remote:
+        if not confirm(f"La branche « {head} » n'est pas sur GitHub. "
+                       f"La pousser (git push -u origin {head}) ?"):
+            return "Refusé : la branche doit être poussée avant de créer la pull request."
+        push = subprocess.run(["git", "push", "-u", "origin", head],
+                              cwd=ROOT, capture_output=True, text=True)
+        if push.returncode != 0:
+            return truncate("Erreur lors du push :\n" + (push.stdout + push.stderr).strip())
+
+    payload = json.dumps({"title": title, "body": body, "head": head, "base": base}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{GITHUB_API}/repos/{repo}/pulls", data=payload, method="POST",
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28",
+                 "User-Agent": f"devagent/{__version__}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            url = json.load(resp)["html_url"]
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        if e.code in (401, 403):
+            return (f"Erreur : jeton GitHub refusé ({e.code}). Vérifiez GITHUB_TOKEN et la "
+                    f"permission « Pull requests : Read and write » sur {repo}. {detail}")
+        if e.code == 404:
+            return (f"Erreur : dépôt {repo} introuvable ou jeton sans accès à ce dépôt. {detail}")
+        return f"Erreur GitHub {e.code} : {detail}"
+    except (urllib.error.URLError, TimeoutError) as e:
+        return f"Erreur : connexion impossible à GitHub ({getattr(e, 'reason', e)})."
+    print(color(f"\n✔ Pull request créée : {url}", "32"))
+    return f"Pull request créée : {url}"
+
+
 FUNCS = {f.__name__: f for f in (
     git_status, get_diff, branch_diff, list_files, read_file, search_code,
-    edit_file, write_file, run_tests, git_commit)}
+    edit_file, write_file, run_tests, git_commit, create_pull_request)}
 READONLY = {"git_status", "get_diff", "branch_diff", "list_files", "read_file", "search_code"}
 
 
@@ -283,6 +373,12 @@ TOOLS = [
     tool("run_tests", "Lance la suite de tests (confirmation humaine requise)."),
     tool("git_commit", "Commite les changements indexés (confirmation humaine requise).",
          {"message": {"type": "string"}}, ["message"]),
+    tool("create_pull_request",
+         "Crée une pull request sur GitHub depuis la branche courante (confirmation humaine requise).",
+         {"title": {"type": "string", "description": "titre court de la pull request"},
+          "body": {"type": "string", "description": "description : contexte, changements, risques, tests"},
+          "base": {"type": "string", "description": "branche de base (auto-détectée si vide)"}},
+         ["title", "body"]),
 ]
 
 USAGE = {"input": 0, "output": 0}
@@ -491,6 +587,8 @@ def main() -> None:
     ap.add_argument("commande", choices=[*PROMPTS, "explain", "hook", "chat"])
     ap.add_argument("cible", nargs="?", help="fichier ou dossier (commande explain)")
     ap.add_argument("--staged", action="store_true", help="review : seulement les changements indexés")
+    ap.add_argument("--create", action="store_true",
+                    help="pr : crée la pull request sur GitHub (nécessite GITHUB_TOKEN)")
     ap.add_argument("--readonly", action="store_true", help="aucun outil d'écriture ni d'exécution")
     ap.add_argument("--provider", help=f"fournisseur : {', '.join(PROVIDERS)} (défaut {PROVIDER})")
     ap.add_argument("--model", help="nom du modèle (défaut : celui du fournisseur)")
@@ -503,9 +601,21 @@ def main() -> None:
         return install_hook()
     if a.commande == "explain" and not a.cible:
         ap.error("explain demande une cible : devagent explain <fichier|dossier>")
+    if a.create:
+        if a.commande != "pr":
+            ap.error("--create ne s'utilise qu'avec la commande pr")
+        if a.readonly:
+            ap.error("--create et --readonly sont incompatibles")
+        if not os.getenv("GITHUB_TOKEN"):
+            sys.exit("Définissez GITHUB_TOKEN (jeton GitHub avec la permission "
+                     "« Pull requests : Read and write », voir README).")
     configure(a.model)
 
-    tools = [t for t in TOOLS if t["name"] in READONLY] if a.readonly else TOOLS
+    if a.readonly:
+        tools = [t for t in TOOLS if t["name"] in READONLY]
+    else:
+        # create_pull_request n'est proposé à l'IA que si --create est demandé.
+        tools = [t for t in TOOLS if t["name"] != "create_pull_request" or a.create]
     print(color(f"Dépôt : {ROOT}  ·  {PROVIDER} / {MODEL}\n", "90"))
 
     try:
@@ -518,6 +628,8 @@ def main() -> None:
             elif a.commande == "review" and a.staged:
                 prompt = ("Relis les changements indexés (get_diff avec staged=true). Signale bugs, "
                           "failles de sécurité et manques de tests. Termine par un verdict.")
+            elif a.commande == "pr" and a.create:
+                prompt = PROMPTS["pr"] + PR_CREATE_SUFFIX
             else:
                 prompt = PROMPTS[a.commande]
             agent([{"role": "user", "content": prompt}], tools)
