@@ -44,7 +44,7 @@ Autre fournisseur compatible : `DEVAGENT_BASE_URL`, `DEVAGENT_API_KEY` et `DEVAG
 | `devagent docs` | Met à jour README et docstrings obsolètes |
 | `devagent test` | Lance les tests et diagnostique les échecs |
 | `devagent fix` | Lance les tests, corrige les échecs avec aperçu du diff |
-| `devagent pr` | Rédige titre et description de pull request |
+| `devagent pr [--create]` | Rédige titre et description de PR ; avec `--create`, crée la PR sur GitHub |
 | `devagent explain <cible>` | Explique un fichier ou dossier |
 | `devagent hook` | Installe un hook pre-commit de relecture automatique |
 | `devagent chat` | Discussion libre sur le dépôt |
@@ -60,6 +60,25 @@ Options : `--readonly` (aucun outil d'écriture), `--provider <nom>`, `--model <
 - Fichier `DEVAGENT.md` à la racine du dépôt : consignes spécifiques au projet (voir l'exemple).
 - Gestion propre des erreurs API (clé invalide, limite gratuite atteinte, réseau) et 3 relances automatiques.
 - Tests unitaires (`pytest`) sur la sécurité des chemins, l'édition et la confirmation.
+
+## Créer une pull request sur GitHub
+
+`devagent pr --create` rédige le titre et la description, puis crée la pull request
+via l'API GitHub après votre confirmation.
+
+1. Créez un jeton sur GitHub : **Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens**, avec la permission **Pull requests : Read and write** sur le dépôt.
+2. Définissez la variable d'environnement (jamais dans le code) :
+
+```bash
+export GITHUB_TOKEN="github_pat_..."          # Linux / macOS
+$env:GITHUB_TOKEN="github_pat_..."            # Windows PowerShell
+```
+
+3. Placez-vous sur une branche de travail et lancez `devagent pr --create`.
+   Si la branche n'est pas encore sur GitHub, devagent propose de la pousser.
+
+Le jeton n'est jamais envoyé à l'IA : il sert uniquement à l'appel GitHub.
 
 ## Sécurité
 
@@ -78,6 +97,7 @@ Options : `--readonly` (aucun outil d'écriture), `--provider <nom>`, `--model <
 - `DEVAGENT_MAX_OUT` : taille max d'un résultat d'outil en caractères (défaut 20000). Baissez-la
   (ex. 8000) si la limite de tokens par minute d'un plan gratuit est dépassée.
 - `DEVAGENT_TEST_CMD` : commande de tests (auto-détection : `php artisan test`, `npm test`, `pytest`).
+- `GITHUB_TOKEN` : jeton GitHub, requis pour `devagent pr --create`.
 
 ## Limites des modèles gratuits
 
